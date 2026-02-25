@@ -1,0 +1,22 @@
+# Local environment files
+.env
+code/.env
+
+# Google credentials and auth artifacts
+credentials.json
+cred/credentials.json.json
+cred/
+**/credentials.json
+**/*credentials*.json
+**/oauth_credentials.json
+**/authorized_user.json
+
+# Python build/runtime artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local runtime/state files
+code/.adk/
+code/.state/
