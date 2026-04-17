@@ -3,11 +3,18 @@ import os
 import re
 import sys
 import time
+import asyncio
+import concurrent.futures
+from contextlib import aclosing
 from pathlib import Path
 from typing import Any
 
 from google import genai
 from google.adk.agents.llm_agent import Agent
+from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
+from google.adk.runners import Runner
+from google.adk.sessions.in_memory_session_service import InMemorySessionService
+from google.adk.tools.agent_tool import AgentTool
 from google.adk.tools.google_search_tool import GoogleSearchTool
 from google.genai import types as genai_types
 
@@ -84,13 +91,14 @@ class QuotaPauseController:
     """Track search call counts; optional sleep support."""
 
     def __init__(self, pause_every_calls: int = 3, pause_seconds: int = 60):
-        self.pause_every_calls = max(1, int(pause_every_calls))
+        # Allow disabling implicit sleep by setting pause_every_calls <= 0.
+        self.pause_every_calls = max(0, int(pause_every_calls))
         self.pause_seconds = max(1, int(pause_seconds))
         self.total_calls = 0
 
     def register_search_call(self, apply_sleep: bool = True) -> None:
         self.total_calls += 1
-        if apply_sleep and self.total_calls % self.pause_every_calls == 0:
+        if apply_sleep and self.pause_every_calls > 0 and self.total_calls % self.pause_every_calls == 0:
             time.sleep(self.pause_seconds)
 
 
@@ -216,7 +224,10 @@ class RateLimitedGoogleSearchTool:
         return ""
 
 
-global_quota_controller = QuotaPauseController(pause_every_calls=1, pause_seconds=30)
+global_quota_controller = QuotaPauseController(
+    pause_every_calls=int(os.getenv("PAUSE_EVERY_SEARCH_CALLS", "0")),
+    pause_seconds=int(os.getenv("PAUSE_SECONDS", "30")),
+)
 search_tool = RateLimitedGoogleSearchTool(inner=raw_search_tool, quota=global_quota_controller)
 
 
@@ -293,376 +304,531 @@ class ResearchContext:
         return text
 
 
-class BaseColumnSubagent:
-    """Subagent contract for one spreadsheet column/field."""
-
-    field_name: str = ""
-
-    def __init__(self, ctx: ResearchContext):
-        self.ctx = ctx
-
-    def existing(self, *keys: str) -> str | None:
-        for key in keys:
-            v = str(self.ctx.church.get(key, "")).strip()
-            if v and v.lower() != "unknown":
-                return v
-        return None
-
-    @staticmethod
-    def pick(text: str, pattern: str) -> str:
-        m = re.search(pattern, text, flags=re.IGNORECASE)
-        return m.group(1) if m else "Unknown"
-
-    def run(self) -> str:
-        raise NotImplementedError
-
-    @staticmethod
-    def is_found(value: str) -> bool:
-        v = (value or "").strip().lower()
-        return bool(v) and v not in {"unknown", "needs manual review"}
-
-    def search_until_found(self, query_suffixes: list[str], extractor) -> str:
-        """
-        Literal subagent behavior:
-        - Run primary queries first, then deeper fallback queries for this column.
-        - Stop as soon as info is found.
-        - Otherwise return Needs manual review.
-        """
-        max_queries = max(1, int(os.getenv("MAX_SEARCHES_PER_ATTRIBUTE", "2")))
-        for suffix in query_suffixes[:max_queries]:
-            text = self.ctx.search_query(self.ctx.base_query(suffix))
-            if text.startswith("__RATE_LIMITED__") or text.startswith("__TRANSIENT_TIMEOUT__"):
-                return "Needs manual review"
-            value = extractor(text)
-            if self.is_found(value):
-                return value
-        return "Needs manual review"
+def _column_instruction(
+    field_name: str,
+    preserve_keys: list[str],
+    query_suffixes: list[str],
+    extraction_rule: str,
+    manual_value: str = "Needs manual review",
+) -> str:
+    return (
+        "You are a single-field enrichment subagent for worship centers.\n"
+        "Input is JSON text with:\n"
+        "- church: object\n"
+        "- area: string\n\n"
+        f"Field to produce: {field_name}\n"
+        "Preserve existing values if any of these keys is present and non-empty/non-unknown: "
+        + json.dumps(preserve_keys, ensure_ascii=False)
+        + "\n"
+        f"Run at most {max(1, int(os.getenv('MAX_SEARCHES_PER_ATTRIBUTE', '7')))} search calls. Only stop searching when you get given information\n"
+        "Build worship-center-specific queries only with center name + area + suffix.\n"
+        "Query suffix order: "
+        + json.dumps(query_suffixes, ensure_ascii=False)
+        + "\n"
+        f"Extract value using this rule: {extraction_rule}\n"
+        f"If still missing, return \"{manual_value}\".\n\n"
+        "Output strict JSON only:\n"
+        f'{{"field":"{field_name}","value":"<resolved value>"}}'
+    )
 
 
-class AddressSubagent(BaseColumnSubagent):
-    field_name = "address"
+def _column_generate_config() -> genai_types.GenerateContentConfig:
+    return genai_types.GenerateContentConfig(
+        automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(
+            disable=False,
+            maximum_remote_calls=max(1, int(os.getenv("MAX_SEARCHES_PER_ATTRIBUTE", "7"))),
+        ),
+        temperature=0.0,
+    )
 
-    def run(self) -> str:
-        v = self.existing("address")
-        if v and "not verified" not in v.lower():
-            return v
-        result = self.search_until_found(
-            [
-                "address location",
-                "google maps address",
-                "official website address",
-                "contact address",
-            ],
-            lambda t: self.pick(
-                t,
-                r"(\d{1,6}\s+[a-z0-9.\-'\s]+(?:st|street|ave|avenue|rd|road|blvd|drive|dr|ln|lane|way|ct|court)\b[^,.]*)",
+
+address_subagent_agent_instance = Agent(
+    name="address_subagent_agent",
+    model=os.getenv("SEARCH_MODEL", "gemini-2.5-flash"),
+    description="Resolve address for one church.",
+    instruction=_column_instruction(
+        "address",
+        ["address"],
+        ["address location", "google maps address", "official website address", "contact address"],
+        'Return full street address. If not fully verified, return "ADDRESS NOT VERIFIED - needs manual review".',
+        "ADDRESS NOT VERIFIED - needs manual review",
+    ),
+    tools=[search_tool],
+    generate_content_config=_column_generate_config(),
+)
+phone_subagent_agent_instance = Agent(
+    name="phone_subagent_agent",
+    model=os.getenv("SEARCH_MODEL", "gemini-2.5-flash"),
+    description="Resolve phone for one church.",
+    instruction=_column_instruction(
+        "phone",
+        ["phone"],
+        ["phone number", "contact phone", "google maps phone", "facebook phone"],
+        "Return one normalized US phone number if found.",
+    ),
+    tools=[search_tool],
+    generate_content_config=_column_generate_config(),
+)
+website_subagent_agent_instance = Agent(
+    name="website_subagent_agent",
+    model=os.getenv("SEARCH_MODEL", "gemini-2.5-flash"),
+    description="Resolve website for one church.",
+    instruction=_column_instruction(
+        "website",
+        ["website"],
+        ["official website", "website", "homepage", "contact site"],
+        "Return one canonical website URL with http/https.",
+    ),
+    tools=[search_tool],
+    generate_content_config=_column_generate_config(),
+)
+attendance_subagent_agent_instance = Agent(
+    name="attendance_subagent_agent",
+    model=os.getenv("SEARCH_MODEL", "gemini-2.5-flash"),
+    description="Resolve attendance for one church.",
+    instruction=_column_instruction(
+        "explicit_attendance",
+        ["explicit_attendance", "attendance", "members", "families"],
+        ["attendance members families", "about us congregation size", "membership count", "average sunday attendance"],
+        "Return numeric attendance/membership text only.",
+    ),
+    tools=[search_tool],
+    generate_content_config=_column_generate_config(),
+)
+google_reviews_subagent_agent_instance = Agent(
+    name="google_reviews_subagent_agent",
+    model=os.getenv("SEARCH_MODEL", "gemini-2.5-flash"),
+    description="Resolve Google reviews for one church.",
+    instruction=_column_instruction(
+        "google_reviews",
+        ["google_reviews", "review_count", "reviews"],
+        ["google maps reviews", "google reviews", "maps rating reviews", "business profile reviews"],
+        "Return numeric review count only.",
+    ),
+    tools=[search_tool],
+    generate_content_config=_column_generate_config(),
+)
+yelp_reviews_subagent_agent_instance = Agent(
+    name="yelp_reviews_subagent_agent",
+    model=os.getenv("SEARCH_MODEL", "gemini-2.5-flash"),
+    description="Resolve Yelp reviews for one church.",
+    instruction=_column_instruction(
+        "yelp_reviews",
+        ["yelp_reviews", "yelp_review_count"],
+        ["yelp reviews", "site:yelp.com reviews", "yelp rating", "yelp worship center listing"],
+        "Return numeric Yelp review count only.",
+    ),
+    tools=[search_tool],
+    generate_content_config=_column_generate_config(),
+)
+yahoo_local_reviews_subagent_agent_instance = Agent(
+    name="yahoo_local_reviews_subagent_agent",
+    model=os.getenv("SEARCH_MODEL", "gemini-2.5-flash"),
+    description="Resolve Yahoo local reviews for one church.",
+    instruction=_column_instruction(
+        "yahoo_local_reviews",
+        ["yahoo_local_reviews", "yahoo_reviews"],
+        ["yahoo local reviews", "site:local.yahoo.com reviews", "yahoo reviews", "yahoo worship center listing"],
+        "Return numeric Yahoo local review count only.",
+    ),
+    tools=[search_tool],
+    generate_content_config=_column_generate_config(),
+)
+facebook_followers_subagent_agent_instance = Agent(
+    name="facebook_followers_subagent_agent",
+    model=os.getenv("SEARCH_MODEL", "gemini-2.5-flash"),
+    description="Resolve Facebook followers for one church.",
+    instruction=_column_instruction(
+        "facebook_followers",
+        ["facebook_followers", "fb_followers", "facebook_likes"],
+        ["site:facebook.com followers", "facebook page likes", "facebook worship center page", "facebook ministry profile"],
+        "Return follower/like count with optional k/m suffix.",
+    ),
+    tools=[search_tool],
+    generate_content_config=_column_generate_config(),
+)
+instagram_followers_subagent_agent_instance = Agent(
+    name="instagram_followers_subagent_agent",
+    model=os.getenv("SEARCH_MODEL", "gemini-2.5-flash"),
+    description="Resolve Instagram followers for one church.",
+    instruction=_column_instruction(
+        "instagram_followers",
+        ["instagram_followers", "ig_followers"],
+        ["site:instagram.com followers", "instagram profile followers", "instagram worship center account", "instagram ministry profile"],
+        "Return follower count with optional k/m suffix.",
+    ),
+    tools=[search_tool],
+    generate_content_config=_column_generate_config(),
+)
+youtube_subscribers_subagent_agent_instance = Agent(
+    name="youtube_subscribers_subagent_agent",
+    model=os.getenv("SEARCH_MODEL", "gemini-2.5-flash"),
+    description="Resolve YouTube subscribers for one church.",
+    instruction=_column_instruction(
+        "youtube_subscribers",
+        ["youtube_subscribers", "yt_subscribers"],
+        ["site:youtube.com subscribers", "youtube channel subscribers", "youtube sermons", "youtube livestream worship center"],
+        "Return subscriber count with optional k/m suffix.",
+    ),
+    tools=[search_tool],
+    generate_content_config=_column_generate_config(),
+)
+activities_subagent_agent_instance = Agent(
+    name="activities_subagent_agent",
+    model=os.getenv("SEARCH_MODEL", "gemini-2.5-flash"),
+    description="Resolve activities for one church.",
+    instruction=_column_instruction(
+        "activities",
+        ["activities"],
+        ["podcast livestream", "outreach youth ministry events", "community programs ministries", "news events sermons"],
+        "Return comma-separated activity keywords (podcast/livestream/outreach/youth ministry/etc).",
+    ),
+    tools=[search_tool],
+    generate_content_config=_column_generate_config(),
+)
+condition_subagent_agent_instance = Agent(
+    name="condition_subagent_agent",
+    model=os.getenv("SEARCH_MODEL", "gemini-2.5-flash"),
+    description="Resolve condition notes for one church.",
+    instruction=_column_instruction(
+        "condition",
+        ["condition"],
+        ["historic aging new campus multi-generational community", "worship center history generations", "about us history mission", "youth ministry next generation"],
+        "Return concise condition notes such as older/aging, very new, multi-generational.",
+    ),
+    tools=[search_tool],
+    generate_content_config=_column_generate_config(),
+)
+signals_subagent_agent_instance = Agent(
+    name="signals_subagent_agent",
+    model=os.getenv("SEARCH_MODEL", "gemini-2.5-flash"),
+    description="Resolve sale/lifecycle signals for one church.",
+    instruction=_column_instruction(
+        "signals",
+        ["signals"],
+        ["for sale closing merger lease declining membership", "worship center property listing", "ceasing operations", "facility rental hall rental"],
+        "Return short signal summary text from strongest discovered evidence.",
+    ),
+    tools=[search_tool],
+    generate_content_config=_column_generate_config(),
+)
+
+# Wrap all subagents with AgentTool instances (explicit style requested).
+address_subagent_tool_instance = AgentTool(agent=address_subagent_agent_instance)
+phone_subagent_tool_instance = AgentTool(agent=phone_subagent_agent_instance)
+website_subagent_tool_instance = AgentTool(agent=website_subagent_agent_instance)
+attendance_subagent_tool_instance = AgentTool(agent=attendance_subagent_agent_instance)
+google_reviews_subagent_tool_instance = AgentTool(agent=google_reviews_subagent_agent_instance)
+yelp_reviews_subagent_tool_instance = AgentTool(agent=yelp_reviews_subagent_agent_instance)
+yahoo_local_reviews_subagent_tool_instance = AgentTool(agent=yahoo_local_reviews_subagent_agent_instance)
+facebook_followers_subagent_tool_instance = AgentTool(agent=facebook_followers_subagent_agent_instance)
+instagram_followers_subagent_tool_instance = AgentTool(agent=instagram_followers_subagent_agent_instance)
+youtube_subscribers_subagent_tool_instance = AgentTool(agent=youtube_subscribers_subagent_agent_instance)
+activities_subagent_tool_instance = AgentTool(agent=activities_subagent_agent_instance)
+condition_subagent_tool_instance = AgentTool(agent=condition_subagent_agent_instance)
+signals_subagent_tool_instance = AgentTool(agent=signals_subagent_agent_instance)
+
+subagent_tool_calls = [
+    ("address", address_subagent_tool_instance),
+    ("phone", phone_subagent_tool_instance),
+    ("website", website_subagent_tool_instance),
+    ("explicit_attendance", attendance_subagent_tool_instance),
+    ("google_reviews", google_reviews_subagent_tool_instance),
+    ("yelp_reviews", yelp_reviews_subagent_tool_instance),
+    ("yahoo_local_reviews", yahoo_local_reviews_subagent_tool_instance),
+    ("facebook_followers", facebook_followers_subagent_tool_instance),
+    ("instagram_followers", instagram_followers_subagent_tool_instance),
+    ("youtube_subscribers", youtube_subscribers_subagent_tool_instance),
+    ("activities", activities_subagent_tool_instance),
+    ("condition", condition_subagent_tool_instance),
+    ("signals", signals_subagent_tool_instance),
+]
+
+
+def _strip_code_fence(text: str) -> str:
+    cleaned = (text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z0-9_+-]*\n?", "", cleaned)
+        cleaned = re.sub(r"\n?```$", "", cleaned)
+    return cleaned.strip()
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    cleaned = _strip_code_fence(text)
+    try:
+        parsed = json.loads(cleaned)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        m = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if not m:
+            return {}
+        try:
+            parsed = json.loads(m.group(0))
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+
+async def _run_agent_once_async(agent: Agent, request_text: str) -> str:
+    timeout_sec = max(10, int(os.getenv("SUBAGENT_TIMEOUT_SEC", "40")))
+    event_limit = max(10, int(os.getenv("SUBAGENT_EVENT_LIMIT", "80")))
+    deadline = time.time() + timeout_sec
+    session_service = InMemorySessionService()
+    runner = Runner(
+        app_name=agent.name,
+        agent=agent,
+        session_service=session_service,
+        memory_service=InMemoryMemoryService(),
+    )
+    session = await session_service.create_session(app_name=agent.name, user_id="local_user", state={})
+    last_content = None
+    content = genai_types.Content(role="user", parts=[genai_types.Part.from_text(text=request_text)])
+    async with aclosing(runner.run_async(user_id=session.user_id, session_id=session.id, new_message=content)) as agen:
+        seen_events = 0
+        async for event in agen:
+            seen_events += 1
+            if event.content:
+                last_content = event.content
+            if seen_events >= event_limit or time.time() >= deadline:
+                break
+    close_result = runner.close()
+    if asyncio.iscoroutine(close_result):
+        await close_result
+    if last_content is None or not getattr(last_content, "parts", None):
+        return ""
+    return "\n".join(
+        p.text for p in last_content.parts if getattr(p, "text", None) and not getattr(p, "thought", False)
+    )
+
+
+def _run_async_safely(coro):
+    """
+    Run a coroutine from sync code, even if an event loop is already active.
+    """
+    timeout_sec = max(10, int(os.getenv("SUBAGENT_SYNC_TIMEOUT_SEC", "50")))
+    try:
+        asyncio.get_running_loop()
+        loop_running = True
+    except RuntimeError:
+        loop_running = False
+
+    if not loop_running:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(lambda: asyncio.run(coro))
+            try:
+                return future.result(timeout=timeout_sec)
+            except concurrent.futures.TimeoutError:
+                print(f"[worker] subagent sync timeout after {timeout_sec}s; returning manual review")
+                return ""
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(lambda: asyncio.run(coro))
+        try:
+            return future.result(timeout=timeout_sec)
+        except concurrent.futures.TimeoutError:
+            print(f"[worker] subagent sync timeout after {timeout_sec}s; returning manual review")
+            return ""
+
+
+def _run_subagent_tool_once(field_name: str, tool: AgentTool, church: dict[str, Any], area: str) -> str:
+    invoker_agent = Agent(
+        name=f"{field_name}_tool_invoker",
+        model=os.getenv("SEARCH_MODEL", "gemini-2.5-flash"),
+        description=f"Invoke tool for {field_name}.",
+        instruction=(
+            f"Call tool `{tool.name}` exactly once using the provided JSON input.\n"
+            "Return strict JSON only in this shape:\n"
+            f'{{"field":"{field_name}","value":"<resolved value>"}}\n'
+            "No markdown."
+        ),
+        tools=[tool],
+        generate_content_config=genai_types.GenerateContentConfig(
+            automatic_function_calling=genai_types.AutomaticFunctionCallingConfig(
+                disable=False,
+                maximum_remote_calls=1,
             ),
-        )
-        return "ADDRESS NOT VERIFIED - needs manual review" if result == "Needs manual review" else result
+            temperature=0.0,
+        ),
+    )
+    payload = {"church": church, "area": area}
+    response_text = _run_async_safely(_run_agent_once_async(invoker_agent, json.dumps(payload, ensure_ascii=False)))
+    if not str(response_text).strip():
+        return "Needs manual review"
+    parsed = _extract_json_object(response_text)
+    if str(parsed.get("value", "")).strip():
+        return str(parsed.get("value")).strip()
+    if str(parsed.get(field_name, "")).strip():
+        return str(parsed.get(field_name)).strip()
+    return "Needs manual review"
 
 
-class PhoneSubagent(BaseColumnSubagent):
-    field_name = "phone"
+def _extract_website(text: str) -> str:
+    m = re.search(r"(https?://[^\s)]+)", text, flags=re.IGNORECASE)
+    return m.group(1) if m else ""
 
-    def run(self) -> str:
-        v = self.existing("phone")
-        if v:
+
+def _extract_phone(text: str) -> str:
+    m = re.search(r"(\+?1?[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})", text)
+    return m.group(1) if m else ""
+
+
+def _extract_address(text: str) -> str:
+    m = re.search(
+        r"(\d{1,6}\s+[a-z0-9.\-'\s]+(?:st|street|ave|avenue|rd|road|blvd|drive|dr|ln|lane|way|ct|court)\b[^,\n]*)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return m.group(1).strip() if m else ""
+
+
+def _extract_numberish(text: str, keyword: str = "") -> str:
+    pat = rf"{keyword}[^0-9]{{0,40}}(\d+(?:\.\d+)?[km]?)" if keyword else r"(\d+(?:\.\d+)?[km]?)"
+    m = re.search(pat, text, flags=re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
+def _resolve_field_direct(field_name: str, church: dict[str, Any], area: str, search: Any) -> str:
+    name = str(church.get("name", "")).strip()
+    min_searches = max(1, int(os.getenv("MIN_SEARCHES_PER_ATTRIBUTE", "3")))
+    max_searches = max(min_searches, min(7, int(os.getenv("MAX_SEARCHES_PER_ATTRIBUTE", "7"))))
+
+    preserve_map: dict[str, list[str]] = {
+        "address": ["address"],
+        "phone": ["phone"],
+        "website": ["website"],
+        "explicit_attendance": ["explicit_attendance", "attendance", "members", "families"],
+        "google_reviews": ["google_reviews", "review_count", "reviews"],
+        "yelp_reviews": ["yelp_reviews", "yelp_review_count"],
+        "yahoo_local_reviews": ["yahoo_local_reviews", "yahoo_reviews"],
+        "facebook_followers": ["facebook_followers", "fb_followers", "facebook_likes"],
+        "instagram_followers": ["instagram_followers", "ig_followers"],
+        "youtube_subscribers": ["youtube_subscribers", "yt_subscribers"],
+        "activities": ["activities"],
+        "condition": ["condition"],
+        "signals": ["signals"],
+    }
+
+    for key in preserve_map.get(field_name, []):
+        v = str(church.get(key, "")).strip()
+        if v and v.lower() not in {"unknown", "needs manual review"}:
             return v
-        return self.search_until_found(
-            [
-                "phone number",
-                "contact phone",
-                "google maps phone",
-                "facebook phone",
-            ],
-            lambda t: self.pick(t, r"(\+?1?[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})"),
-        )
 
+    suffixes_map: dict[str, list[str]] = {
+        "address": ["address location", "google maps address", "official website address"],
+        "phone": ["phone number", "contact phone", "google maps phone"],
+        "website": ["official website", "homepage", "contact site"],
+        "explicit_attendance": ["attendance members families", "congregation size", "average sunday attendance"],
+        "google_reviews": ["google maps reviews", "google reviews"],
+        "yelp_reviews": ["yelp reviews", "site:yelp.com reviews"],
+        "yahoo_local_reviews": ["yahoo local reviews", "site:local.yahoo.com reviews"],
+        "facebook_followers": ["site:facebook.com followers", "facebook page likes"],
+        "instagram_followers": ["site:instagram.com followers", "instagram profile followers"],
+        "youtube_subscribers": ["site:youtube.com subscribers", "youtube channel subscribers"],
+        "activities": ["podcast livestream outreach youth ministry", "community programs ministries events"],
+        "condition": ["historic aging new campus multi-generational", "worship center history mission youth ministry"],
+        "signals": ["for sale closing merger lease", "worship center property listing ceasing operations"],
+    }
 
-class WebsiteSubagent(BaseColumnSubagent):
-    field_name = "website"
+    extracted_signals: list[str] = []
+    found_value = ""
+    base_suffixes = suffixes_map.get(field_name, [])
+    query_modifiers = ["", "official", "contact", "directory", "latest", "local listing", "community"]
+    queries: list[str] = []
+    seen: set[str] = set()
+    for suffix in base_suffixes:
+        for mod in query_modifiers:
+            q = f"\"{name}\" {area} {suffix} {mod}".strip()
+            if q in seen:
+                continue
+            seen.add(q)
+            queries.append(q)
+            if len(queries) >= max_searches:
+                break
+        if len(queries) >= max_searches:
+            break
 
-    def run(self) -> str:
-        v = self.existing("website")
-        if v:
-            return v
-        def extract(text: str) -> str:
-            m = re.search(r"(https?://[^\s)]+)", text, flags=re.IGNORECASE)
-            return m.group(1) if m else "Unknown"
+    for idx, query in enumerate(queries):
+        result = search(query)
+        text = ResearchContext.as_text(result)
+        if not text or text.startswith("__RATE_LIMITED__") or text.startswith("__TRANSIENT_TIMEOUT__"):
+            continue
 
-        return self.search_until_found(
-            [
-                "official website",
-                "website",
-                "homepage",
-                "contact site",
-            ],
-            extract,
-        )
-
-
-class AttendanceSubagent(BaseColumnSubagent):
-    field_name = "explicit_attendance"
-
-    def run(self) -> str:
-        v = self.existing("explicit_attendance", "attendance", "members", "families")
-        if v:
-            return v
-        def extract(text: str) -> str:
-            m = re.search(
-                r"(?:attendance|members?|families|congregation)\D{0,20}(\d{1,4})|(\d{1,4})\D{0,20}(?:attendance|members?|families|congregation)",
-                text,
-                flags=re.IGNORECASE,
-            )
-            if not m:
-                return "Unknown"
-            return (m.group(1) or m.group(2) or "Unknown").strip()
-
-        return self.search_until_found(
-            [
-                "attendance members families",
-                "about us congregation size",
-                "membership count",
-                "average sunday attendance",
-            ],
-            extract,
-        )
-
-
-class GoogleReviewsSubagent(BaseColumnSubagent):
-    field_name = "google_reviews"
-
-    def run(self) -> str:
-        v = self.existing("google_reviews", "review_count", "reviews")
-        if v:
-            return v
-        return self.search_until_found(
-            [
-                "google maps reviews",
-                "google reviews",
-                "maps rating reviews",
-                "business profile reviews",
-            ],
-            lambda t: self.pick(t, r"(\d{1,5})\s+reviews?"),
-        )
-
-
-class YelpReviewsSubagent(BaseColumnSubagent):
-    field_name = "yelp_reviews"
-
-    def run(self) -> str:
-        v = self.existing("yelp_reviews", "yelp_review_count")
-        if v:
-            return v
-        return self.search_until_found(
-            [
-                "yelp reviews",
-                "site:yelp.com reviews",
-                "yelp rating",
-                "yelp church listing",
-            ],
-            lambda t: self.pick(t, r"yelp[^0-9]{0,40}(\d{1,5})\s+reviews?"),
-        )
-
-
-class YahooLocalReviewsSubagent(BaseColumnSubagent):
-    field_name = "yahoo_local_reviews"
-
-    def run(self) -> str:
-        v = self.existing("yahoo_local_reviews", "yahoo_reviews")
-        if v:
-            return v
-        return self.search_until_found(
-            [
-                "yahoo local reviews",
-                "site:local.yahoo.com reviews",
-                "yahoo reviews",
-                "yahoo church listing",
-            ],
-            lambda t: self.pick(t, r"yahoo(?:\s+local)?[^0-9]{0,40}(\d{1,5})\s+reviews?"),
-        )
-
-
-class FacebookFollowersSubagent(BaseColumnSubagent):
-    field_name = "facebook_followers"
-
-    def run(self) -> str:
-        v = self.existing("facebook_followers", "fb_followers", "facebook_likes")
-        if v:
-            return v
-        return self.search_until_found(
-            [
-                "site:facebook.com followers",
-                "facebook page likes",
-                "facebook church page",
-                "facebook ministry profile",
-            ],
-            lambda t: self.pick(t, r"(\d+(?:\.\d+)?[km]?)\s+(?:followers?|likes?)"),
-        )
-
-
-class InstagramFollowersSubagent(BaseColumnSubagent):
-    field_name = "instagram_followers"
-
-    def run(self) -> str:
-        v = self.existing("instagram_followers", "ig_followers")
-        if v:
-            return v
-        return self.search_until_found(
-            [
-                "site:instagram.com followers",
-                "instagram profile followers",
-                "instagram church account",
-                "instagram ministry profile",
-            ],
-            lambda t: self.pick(t, r"(\d+(?:\.\d+)?[km]?)\s+followers?"),
-        )
-
-
-class YouTubeSubscribersSubagent(BaseColumnSubagent):
-    field_name = "youtube_subscribers"
-
-    def run(self) -> str:
-        v = self.existing("youtube_subscribers", "yt_subscribers")
-        if v:
-            return v
-        return self.search_until_found(
-            [
-                "site:youtube.com subscribers",
-                "youtube channel subscribers",
-                "youtube sermons",
-                "youtube livestream church",
-            ],
-            lambda t: self.pick(t, r"(\d+(?:\.\d+)?[km]?)\s+subscribers?"),
-        )
-
-
-class ActivitiesSubagent(BaseColumnSubagent):
-    field_name = "activities"
-
-    def run(self) -> str:
-        v = self.existing("activities")
-        if v:
-            return v
-        keywords = [
-            "podcast",
-            "livestream",
-            "youtube",
-            "community outreach",
-            "food pantry",
-            "youth ministry",
-            "bible study",
-            "school",
-            "daycare",
-            "mission",
-            "retreat",
-            "conference",
-        ]
-
-        def extract(text: str) -> str:
+        if field_name == "address":
+            val = _extract_address(text)
+            if val:
+                found_value = val
+        elif field_name == "phone":
+            val = _extract_phone(text)
+            if val:
+                found_value = val
+        elif field_name == "website":
+            val = _extract_website(text)
+            if val:
+                found_value = val
+        elif field_name in {"explicit_attendance", "google_reviews", "yelp_reviews", "yahoo_local_reviews"}:
+            val = _extract_numberish(text)
+            if val:
+                found_value = val
+        elif field_name == "facebook_followers":
+            val = _extract_numberish(text, "facebook")
+            if val:
+                found_value = val
+        elif field_name == "instagram_followers":
+            val = _extract_numberish(text, "instagram")
+            if val:
+                found_value = val
+        elif field_name == "youtube_subscribers":
+            val = _extract_numberish(text, "youtube")
+            if val:
+                found_value = val
+        elif field_name == "activities":
             lower = text.lower()
-            found = [k for k in keywords if k in lower]
-            return ", ".join(sorted(set(found))) if found else "Unknown"
-
-        return self.search_until_found(
-            [
-                "podcast livestream",
-                "outreach youth ministry events",
-                "community programs ministries",
-                "news events sermons",
-            ],
-            extract,
-        )
-
-
-class ConditionSubagent(BaseColumnSubagent):
-    field_name = "condition"
-
-    def run(self) -> str:
-        v = self.existing("condition")
-        if v:
-            return v
-        def extract(text: str) -> str:
+            keys = [k for k in ["podcast", "livestream", "outreach", "youth ministry", "bible study", "community"] if k in lower]
+            if keys:
+                found_value = ", ".join(sorted(set(keys)))
+        elif field_name == "condition":
             lower = text.lower()
             notes: list[str] = []
-            if any(k in lower for k in ["historic", "older", "aging", "long-standing", "longstanding"]):
+            if any(k in lower for k in ["historic", "aging", "older", "long-standing"]):
                 notes.append("older/aging")
-            if any(k in lower for k in ["new church", "new campus", "newly opened", "recently opened"]):
+            if any(k in lower for k in ["new worship center", "new campus", "newly opened", "recently opened"]):
                 notes.append("very new")
             if any(k in lower for k in ["multi-generational", "multigenerational", "served generations"]):
                 notes.append("multi-generational")
-            if any(k in lower for k in ["youth ministry", "next generation", "younger generation"]):
-                notes.append("next-generation dependence signals")
-            return "; ".join(notes) if notes else "Unknown"
+            if notes:
+                found_value = "; ".join(notes)
+        elif field_name == "signals":
+            extracted_signals.append(ResearchContext.compact(text, max_len=240))
 
-        return self.search_until_found(
-            [
-                "historic aging new campus multi-generational community",
-                "church history generations",
-                "about us history mission",
-                "youth ministry next generation",
-            ],
-            extract,
-        )
+        # Require at least min_searches attempts; after that, stop as soon as we find the value.
+        if found_value and (idx + 1) >= min_searches:
+            return found_value
 
-
-class SignalsSubagent(BaseColumnSubagent):
-    field_name = "signals"
-
-    def run(self) -> str:
-        v = self.existing("signals")
-        if v:
-            return v
-        merged = " ".join(self.ctx.cache.values())
-        return self.ctx.compact(merged) if merged.strip() else "Needs manual review"
+    if field_name == "address":
+        return "ADDRESS NOT VERIFIED - needs manual review"
+    if found_value:
+        return found_value
+    if field_name == "signals" and extracted_signals:
+        return " | ".join(extracted_signals[:2])
+    return "Needs manual review"
 
 
-class ChurchResearchWorker:
-    """
-    Class X: church-specific orchestrator that runs subagent tools per column.
-    """
-
-    def __init__(
-        self,
-        church: dict[str, Any],
-        area: str,
-        search: Any,
-        persisted_cache: dict[str, str] | None = None,
-        on_cache_update=None,
-    ):
-        self.ctx = ResearchContext(
-            church=church,
-            area=area,
-            search=search,
-            persisted_cache=persisted_cache,
-            on_cache_update=on_cache_update,
-        )
-        self.subagents: list[BaseColumnSubagent] = [
-            AddressSubagent(self.ctx),
-            PhoneSubagent(self.ctx),
-            WebsiteSubagent(self.ctx),
-            AttendanceSubagent(self.ctx),
-            GoogleReviewsSubagent(self.ctx),
-            YelpReviewsSubagent(self.ctx),
-            YahooLocalReviewsSubagent(self.ctx),
-            FacebookFollowersSubagent(self.ctx),
-            InstagramFollowersSubagent(self.ctx),
-            YouTubeSubscribersSubagent(self.ctx),
-            ActivitiesSubagent(self.ctx),
-            ConditionSubagent(self.ctx),
-            SignalsSubagent(self.ctx),
-        ]
-
-    def run_all_column_tools(self) -> dict[str, Any]:
-        for subagent in self.subagents:
-            try:
-                self.ctx.church[subagent.field_name] = subagent.run()
-            except Exception:
-                self.ctx.church[subagent.field_name] = self.ctx.church.get(subagent.field_name, "Needs manual review") or "Needs manual review"
-
-        if not str(self.ctx.church.get("followers", "")).strip():
-            self.ctx.church["followers"] = self.ctx.church.get("explicit_attendance", "Needs manual review")
-        return self.ctx.church
+def run_worker_subagents(church: dict[str, Any], area: str, search: Any) -> dict[str, Any]:
+    merged = dict(church)
+    church_name = str(merged.get("name", "")).strip() or "<unknown church>"
+    for field_name, _tool in subagent_tool_calls:
+        print(f"[worker] {church_name} -> resolving `{field_name}`")
+        try:
+            value = _resolve_field_direct(field_name=field_name, church=merged, area=area, search=search)
+        except Exception:
+            value = "Needs manual review"
+        if field_name == "address" and value == "Needs manual review":
+            value = "ADDRESS NOT VERIFIED - needs manual review"
+        merged[field_name] = value
+        print(f"[worker] {church_name} -> `{field_name}` done")
+    if not str(merged.get("followers", "")).strip():
+        merged["followers"] = merged.get("explicit_attendance", "Needs manual review")
+    return merged
 
 
 class EnrichChurchesAndWriteTool:
@@ -704,7 +870,7 @@ class EnrichChurchesAndWriteTool:
             search_cache[query] = value
 
         enriched: list[dict[str, Any]] = []
-        max_calls_per_run = max(10, int(os.getenv("MAX_SEARCH_CALLS_PER_RUN", "60")))
+        max_calls_per_run = max(1, int(os.getenv("MAX_SEARCH_CALLS_PER_RUN", "9000000")))
         for church in churches:
             if not isinstance(church, dict):
                 continue
@@ -726,45 +892,26 @@ class EnrichChurchesAndWriteTool:
                 enriched.append(row)
                 continue
             key = self._church_key(church, area)
+            use_row_cache = os.getenv("ENABLE_CHURCH_RESULT_CACHE", "0").strip() == "1"
             cached_row = church_results.get(key)
-            if isinstance(cached_row, dict):
+            if use_row_cache and isinstance(cached_row, dict):
                 enriched.append(cached_row)
                 continue
             if isinstance(self.search, RateLimitedGoogleSearchTool) and time.time() < self.search.cooldown_until:
-                # During cooldown, skip expensive enrichment and mark for manual review.
-                row = (
-                    {
-                        **church,
-                        "explicit_attendance": church.get("explicit_attendance", "Needs manual review"),
-                        "google_reviews": church.get("google_reviews", "Needs manual review"),
-                        "yelp_reviews": church.get("yelp_reviews", "Needs manual review"),
-                        "yahoo_local_reviews": church.get("yahoo_local_reviews", "Needs manual review"),
-                        "facebook_followers": church.get("facebook_followers", "Needs manual review"),
-                        "instagram_followers": church.get("instagram_followers", "Needs manual review"),
-                        "youtube_subscribers": church.get("youtube_subscribers", "Needs manual review"),
-                        "activities": church.get("activities", "Needs manual review"),
-                        "condition": church.get("condition", "Needs manual review"),
-                        "signals": f"Rate-limited: {self.search.last_error or 'RESOURCE_EXHAUSTED'}",
-                        "followers": church.get("followers", "Needs manual review"),
-                    }
+                wait_left = max(1, int(self.search.cooldown_until - time.time()))
+                print(
+                    f"[enrich_churches_and_write] Cooldown active ({wait_left}s). "
+                    "Waiting and then continuing research for remaining worship centers..."
                 )
-                enriched.append(row)
-                church_results[key] = row
-                self.store.save({"search_cache": search_cache, "church_results": church_results})
-                continue
-            worker = ChurchResearchWorker(
-                church=church,
-                area=area,
-                search=self.search,
-                persisted_cache=search_cache,
-                on_cache_update=on_cache_update,
-            )
-            row = worker.run_all_column_tools()
+                time.sleep(wait_left)
+            row = run_worker_subagents(church=church, area=area, search=self.search)
             enriched.append(row)
             church_results[key] = row
             self.store.save({"search_cache": search_cache, "church_results": church_results})
 
+        print(f"[enrich_churches_and_write] Enrichment complete. Rows: {len(enriched)}. Starting sheet write...")
         result = self.sheet_tool.write_churches(enriched)
+        print(f"[enrich_churches_and_write] Sheet write finished. Result: {result}")
         self.store.save({"search_cache": search_cache, "church_results": church_results})
         return f"{result} (Search calls used: {self.quota.total_calls}; pause_for_quota used explicitly.)"
 
@@ -779,27 +926,30 @@ enrich_churches_and_write = EnrichChurchesAndWriteTool(
 root_agent = Agent(
     name="church_finder_agent",
     model="gemini-2.5-flash",
-    description="Find churches in a user-provided area and enrich all spreadsheet columns per church.",
+    description="Find worship centers in a user-provided area and enrich all spreadsheet columns per center.",
     instruction=(
         """
-You help find churches in a user-provided area.
+You help find worship centers in a user-provided area.
 
 Workflow (must follow):
 1) Discovery:
-- Build an array of churches for the requested area using search.
+- Build an array of worship centers for the requested area using search.
 - Deduplicate by name + address.
-- Keep at least name and address for each church.
+- Keep at least name and address for each worship center.
 - Search calls can run back-to-back.
+-Also, you may search worship center to help find more options (doesn't have to be strictly church)
+- if the user asks for multiple areas look through all of those areas
+
 
 2) Enrichment delegation:
 - Call enrich_churches_and_write once with:
   - churches_json: JSON array from step 1
   - area: user location
 - Do not call write_churches_to_sheet directly unless enrich_churches_and_write fails.
-- Enrichment subagents each do 1-2 searches for their own column, then return "Needs manual review" if still missing.
-- IMPORTANT: Do per-church, per-attribute lookups only.
-- Never run one search intended to fetch addresses/reviews/followers for multiple churches at once.
-- For each church row, resolve address/reviews/socials/activities independently.
+- Enrichment research does at least 3 searches per attribute (up to 7), and may stop early only after finding the desired value.
+- IMPORTANT: Do per-worship-center, per-attribute lookups only.
+- Never run one search intended to fetch addresses/reviews/followers for multiple worship centers at once.
+- For each center row, resolve address/reviews/socials/activities independently.
 - Pause policy: use pause_for_quota only when needed, and never call pause_for_quota twice in a row.
 
 3) Quota behavior:

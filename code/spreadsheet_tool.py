@@ -22,6 +22,7 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Tuple
 import time
+import concurrent.futures
 
 import gspread
 
@@ -34,6 +35,7 @@ class GoogleSheetsSpreadsheetTool:
         self.description = "Write church/mosque data into a Google Sheets spreadsheet."
         self.spreadsheet_name = spreadsheet_name
         self._client = None  # Lazy load on first use
+        self.request_timeout_sec = max(10, int(os.getenv("SHEETS_REQUEST_TIMEOUT_SEC", "45")))
 
         # Expanded headers to include audit/debug info for grading.
         self.headers = [
@@ -515,7 +517,28 @@ class GoogleSheetsSpreadsheetTool:
         """Lazily authenticate and return client on first access."""
         if self._client is None:
             self._client = self._authenticate()
+            self._configure_client_timeout(self._client)
         return self._client
+
+    def _configure_client_timeout(self, client: gspread.Client) -> None:
+        """Best-effort timeout config so network stalls fail fast."""
+        try:
+            # gspread >= 6
+            client.set_timeout(self.request_timeout_sec)
+            return
+        except Exception:
+            pass
+        try:
+            # Fallback for older internals.
+            client.http_client.set_timeout(self.request_timeout_sec)
+        except Exception:
+            pass
+
+    def _run_with_timeout(self, fn, *args, **kwargs):
+        """Run blocking gspread calls with a hard timeout."""
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(lambda: fn(*args, **kwargs))
+            return future.result(timeout=self.request_timeout_sec)
 
     @staticmethod
     def _service_account_email_hint() -> str:
@@ -642,12 +665,13 @@ class GoogleSheetsSpreadsheetTool:
             return "No church data to write."
 
         try:
-            spreadsheet = self.create_or_get_spreadsheet()
+            spreadsheet = self._run_with_timeout(self.create_or_get_spreadsheet)
             worksheet = spreadsheet.sheet1
 
-            worksheet.clear()
-            worksheet.append_row(self.headers)
+            self._run_with_timeout(worksheet.clear)
+            self._run_with_timeout(worksheet.append_row, self.headers)
 
+            all_rows: list[list[Any]] = []
             for church in churches_data:
                 name = str(church.get("name", "")).strip()
                 address = str(church.get("address", "")).strip() or "ADDRESS NOT VERIFIED - needs manual review"
@@ -712,7 +736,10 @@ class GoogleSheetsSpreadsheetTool:
                     breakdown,
                     deal_score,
                 ]
-                worksheet.append_row(row)
+                all_rows.append(row)
+
+            if all_rows:
+                self._run_with_timeout(worksheet.append_rows, all_rows, value_input_option="RAW")
 
             # Format header row (optional): some gspread installs do not expose gspread.formatting.
             try:
@@ -730,6 +757,11 @@ class GoogleSheetsSpreadsheetTool:
             print(message)
             return message
 
+        except concurrent.futures.TimeoutError:
+            return (
+                f"Error writing to Google Sheets: timed out after {self.request_timeout_sec}s. "
+                "This usually means network/proxy/auth latency to Google APIs."
+            )
         except Exception as e:
             raw = str(e)
             if "ProxyError" in raw or "oauth2.googleapis.com" in raw or "127.0.0.1:9" in raw:
